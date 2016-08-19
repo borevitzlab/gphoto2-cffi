@@ -684,6 +684,10 @@ class Camera(object):
             # Trigger the property
             self._cam
 
+    @exit_after
+    def release(self):
+        self._logger.debug("Releasing Camera")
+
     @property
     def supported_operations(self):
         """ All operations supported by the camera. """
