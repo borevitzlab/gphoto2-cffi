@@ -21,8 +21,9 @@ offering access to most of the library's features.
     # or
     my_cam = next(gp.list_cameras())
 
-    # Capture an image to the camera's RAM and get its data
-    imgdata = my_cam.capture()
+    # Capture an image or images to the camera's RAM and get its data
+
+    imgdata = list(my_cam.capture())
 
     # Grab a preview from the camera
     previewdata = my_cam.get_preview()
@@ -32,7 +33,7 @@ offering access to most of the library's features.
 
     # Iterate over a file's content
     with open("image.jpg", "wb") as fp:
-        for chunk in my_cam.files[0].iter_data():
+        for chunk in my_cam.files[0].iter_bytestring():
             fp.write(chunk)
 
     # Get a configuration value

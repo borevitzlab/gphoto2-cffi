@@ -11,6 +11,7 @@ import sys
 import time
 from collections import namedtuple
 from datetime import datetime
+from io import BytesIO
 
 from . import errors, backend
 from .backend import ffi, lib
@@ -84,7 +85,6 @@ def supported_cameras():
     out = sorted(out, key=key_func)
     return {k: tuple(x[0] for x in v)
             for k, v in itertools.groupby(out, key_func)}
-    return out
 
 
 def exit_after(meth=None, cam_struc=None):
@@ -100,6 +100,7 @@ def exit_after(meth=None, cam_struc=None):
         rval = meth(self, *args, **kwargs)
         lib.gp_camera_exit(cam, ctx)
         return rval
+
     return wrapped
 
 
@@ -134,6 +135,7 @@ class VideoCaptureContext(object):
     upon leaving. Get the resulting videofile by accessing the
     :py:attr:`videofile` attribute.
     """
+
     def __init__(self, camera):
         #: Camera the capture is running on
         self.camera = camera
@@ -149,8 +151,7 @@ class VideoCaptureContext(object):
     def stop(self):
         """ Stop the capture. """
         self.camera._get_config()['actions']['movie'].set(False)
-        self.videofile = self.camera._wait_for_event(
-            event_type=lib.GP_EVENT_FILE_ADDED)
+        self.videofile = self.camera._wait_for_event(event_type=lib.GP_EVENT_FILE_ADDED)
         if self._old_captarget != "Memory card":
             self.camera.config['settings']['capturetarget'].set(
                 self._old_captarget)
@@ -166,6 +167,7 @@ class VideoCaptureContext(object):
 
 class Directory(object):
     """ A directory on the camera. """
+
     def __init__(self, name, parent, camera):
         self.name = name
         self.parent = parent
@@ -261,12 +263,19 @@ class Directory(object):
 
 class File(object):
     """ A file on the camera. """
-    def __init__(self, name, directory, camera):
+
+    def __init__(self, name, directory, camera, ftype="normal"):
         self.name = name
         self.directory = directory
         self._cam = camera
+        self.ftype = ftype
         self._operations = camera._abilities.file_operations
-        self.__info = None
+        self._readable = False
+        self._file_bytes = BytesIO()
+        self.camfile_p = \
+            self.data_p = \
+            self.length_p = \
+            self.__info = None
 
     @property
     def supported_operations(self):
@@ -280,6 +289,10 @@ class File(object):
         :rtype: int
         """
         return int(self._info.file.size)
+
+    @property
+    def readable(self):
+        return self._readable
 
     @property
     def mimetype(self):
@@ -319,6 +332,61 @@ class File(object):
         """
         return datetime.fromtimestamp(self._info.file.mtime)
 
+    @property
+    def closed(self):
+        if self._file_bytes:
+            return self._file_bytes.closed
+        else:
+            raise OSError("File not opened")
+
+    @property
+    def exif(self):
+        """
+        Exif bytes for the file. Haven't worked out how to make any use of it though.
+        :return: bytes
+        """
+        try:
+            with File(self.name, self.directory, self._cam, ftype="exif") as f:
+                return f.read()
+        except errors.GPhoto2Error as e:
+            return None
+
+    @property
+    def raw(self):
+        """
+        Raw bayer data for the image.
+        :return: bytes
+        """
+        try:
+            with File(self.name, self.directory, self._cam, ftype="raw") as f:
+                return f.read()
+        except errors.GPhoto2Error as e:
+            return None
+
+    @property
+    def metadata(self):
+        """
+        metadata for the file.
+        :return: bytes
+        """
+        try:
+            with File(self.name, self.directory, self._cam, ftype="metadata") as f:
+                return f.read()
+        except errors.GPhoto2Error as e:
+            return None
+
+    @property
+    def audio(self):
+        """
+        audio for the file, will most likely only be useful for movies.
+        :return: bytes
+        """
+        try:
+            with File(self.name, self.directory, self._cam, ftype="audio") as f:
+                return f.read()
+        except errors.GPhoto2Error as e:
+            return None
+
     @exit_after
     def save(self, target_path, ftype='normal'):
         """ Save file content to a local file.
@@ -335,58 +403,98 @@ class File(object):
                 self._cam._cam, self.directory.path.encode(),
                 self.name.encode(), backend.FILE_TYPES[ftype], camfile_p[0],
                 self._cam._ctx)
-
-    @exit_after
-    def get_data(self, ftype='normal'):
-        """ Get file content as a bytestring.
-
-        :param ftype:       Select 'view' on file.
-        :type ftype:        str
-        :return:            File content
-        :rtype:             bytes
-        """
-        camfile_p = ffi.new("CameraFile**")
-        lib.gp_file_new(camfile_p)
-        lib.gp_camera_file_get(
-            self._cam._cam, self.directory.path.encode(), self.name.encode(),
-            backend.FILE_TYPES[ftype], camfile_p[0], self._cam._ctx)
-        data_p = ffi.new("char**")
-        length_p = ffi.new("unsigned long*")
-        lib.gp_file_get_data_and_size(camfile_p[0], data_p, length_p)
-        byt = bytes(ffi.buffer(data_p[0], length_p[0]))
-        # gphoto2 camera files MUST be freed.
+        # free file after.
         lib.gp_file_free(camfile_p[0])
-        # just to be safe.
-        del data_p, length_p, camfile_p
-        return byt
-
-    @exit_after
-    def iter_data(self, chunk_size=2**16, ftype='normal'):
-        """ Get an iterator that yields chunks of the file content.
-
-        :param chunk_size:  Size of yielded chunks in bytes
-        :type chunk_size:   int
-        :param ftype:       Select 'view' on file.
-        :type ftype:        str
-        :return:            Iterator
-        """
-        self._check_type_supported(ftype)
-        buf_p = ffi.new("char[{0}]".format(chunk_size))
-        size_p = ffi.new("uint64_t*")
-        offset_p = ffi.new("uint64_t*")
-        for chunk_idx in range(int(math.ceil(self.size/chunk_size))):
-            size_p[0] = chunk_size
-            lib.gp_camera_file_read(
-                self._cam._cam, self.directory.path.encode(),
-                self.name.encode(), backend.FILE_TYPES[ftype], offset_p[0],
-                buf_p, size_p, self._cam._ctx)
-            yield ffi.buffer(buf_p, size_p[0])[:]
 
     @exit_after
     def remove(self):
         """ Remove file from device. """
         lib.gp_camera_file_delete(self._cam._cam, self.directory.path.encode(),
                                   self.name.encode(), self._cam._ctx)
+
+    def remove_noexit(self):
+        """ Remove file from device without shutting down connection. """
+        lib.gp_camera_file_delete(self._cam._cam, self.directory.path.encode(),
+                                  self.name.encode(), self._cam._ctx)
+
+    def open(self):
+        """
+        reads image from the camera to the internal BytesIO object.
+        :rtype: :py:class:`File`
+        """
+        self.camfile_p = ffi.new("CameraFile**")
+        self.data_p = ffi.new("char**")
+        self.length_p = ffi.new("unsigned long*")
+        lib.gp_file_new(self.camfile_p)
+        lib.gp_camera_file_get(
+            self._cam._cam, self.directory.path.encode(), self.name.encode(),
+            backend.FILE_TYPES[self.ftype], self.camfile_p[0], self._cam._ctx)
+
+        lib.gp_file_get_data_and_size(self.camfile_p[0], self.data_p, self.length_p)
+        # make sure that internal BytesIO exises and is clear
+        self._file_bytes = BytesIO()
+        self._file_bytes.write(bytes(ffi.buffer(self.data_p[0], self.length_p[0])))
+        self._file_bytes.seek(0)
+        self._readable = True
+        return self
+
+    def close(self):
+        """
+        Releases the gphoto camera file.
+        Closes BytesIO.
+        :return:
+        """
+        # gphoto2 CameraFile MUST be freed
+        if self.camfile_p is not None:
+            lib.gp_file_free(self.camfile_p[0])
+        # just to be safe.
+        del self.data_p, self.length_p, self.camfile_p
+        self.data_p = self.length_p = self.camfile_p = None
+        # close the bytesio
+        self._file_bytes.close()
+        self._readable = False
+
+    def bytes_copy(self):
+        """
+        returns a copy of BytesIO of the image.
+        :return: BytesIO
+        """
+        if self._readable:
+            return BytesIO(self._file_bytes.read())
+        else:
+            raise OSError("File not opened")
+
+    @exit_after
+    @property
+    def bytestring(self):
+        """ Get file content as bytes.
+        :return:            File content
+        :rtype:             bytes
+        """
+        self.seek(0)
+        return self.read()
+
+    @exit_after
+    def iter_bytestring(self, chunk_size=2 ** 16, ftype='normal'):
+        """ Get an iterator that yields chunks of the file content.
+        :param chunk_size:  Size of yielded chunks in bytes
+        :type chunk_size:   int
+        :param ftype:       Select 'view' on file.
+        :type ftype:        str
+        :return:            Iterator
+        """
+        # TODO: _check_type_supported doesnt exist, so this method always fails.
+        self._check_type_supported(ftype)
+        buf_p = ffi.new("char[{0}]".format(chunk_size))
+        size_p = ffi.new("uint64_t*")
+        offset_p = ffi.new("uint64_t*")
+        for chunk_idx in range(int(math.ceil(self.size / chunk_size))):
+            size_p[0] = chunk_size
+            lib.gp_camera_file_read(
+                self._cam._cam, self.directory.path.encode(),
+                self.name.encode(), backend.FILE_TYPES[ftype], offset_p[0],
+                buf_p, size_p, self._cam._ctx)
+            yield ffi.buffer(buf_p, size_p[0])[:]
 
     @property
     def _info(self):
@@ -402,6 +510,30 @@ class File(object):
                                  "file exists on the device?")
         return self.__info
 
+    def read(self, *args, **kwargs):
+        if self._readable:
+            return self._file_bytes.read(*args, **kwargs)
+        else:
+            raise OSError("File not opened")
+
+    def seek(self, *args, **kwargs):
+        if self._readable:
+            return self._file_bytes.seek(*args, **kwargs)
+        else:
+            raise OSError("File not opened")
+
+    def tell(self):
+        if self._readable:
+            return self._file_bytes.tell()
+        else:
+            raise OSError("File not opened")
+
+    def __enter__(self):
+        return self.open()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     def __eq__(self, other):
         return (self.name == other.name and
                 self.directory == other.directory and
@@ -414,6 +546,7 @@ class File(object):
 
 class ConfigItem(object):
     """ A configuration option on the device. """
+
     def __init__(self, widget, camera):
         self._widget = widget
         root_p = ffi.new("CameraWidget**")
@@ -477,7 +610,7 @@ class ConfigItem(object):
         if self.type == 'selection':
             if value not in self.choices:
                 raise ValueError("Invalid choice (valid: {0})".format(
-                                 repr(self.choices)))
+                    repr(self.choices)))
             val_p = ffi.new("const char[]", value.encode())
         elif self.type == 'text':
             if not isinstance(value, basestring):
@@ -537,9 +670,9 @@ class Camera(object):
     :param device:      USB device number
     :param lazy:        Only initialize the device when needed
     """
+
     def __init__(self, bus=None, device=None, lazy=False, _abilities=None):
         self._logger = logging.getLogger()
-
         # NOTE: It is not strictly neccessary to create a context for every
         #       device, however it is significantly (>500ms) faster when
         #       actions are to be performed simultaneously.
@@ -657,6 +790,7 @@ class Camera(object):
         """ Utility method that yields all files on the device's file
             systems.
         """
+
         def list_files_recursively(directory):
             f_gen = itertools.chain(
                 directory.files,
@@ -664,12 +798,14 @@ class Camera(object):
                        for d in directory.directories))
             for f in f_gen:
                 yield f
+
         return list_files_recursively(self.filesystem)
 
     def list_all_directories(self):
         """ Utility method that yields all directories on the device's file
             systems.
         """
+
         def list_dirs_recursively(directory):
             if directory == self.filesystem:
                 yield directory
@@ -679,10 +815,11 @@ class Camera(object):
                        for d in directory.directories))
             for d in d_gen:
                 yield d
+
         return list_dirs_recursively(self.filesystem)
 
     @exit_after
-    def capture(self, to_camera_storage=False):
+    def capture(self, to_camera_storage=False, timeout=10):
         """ Capture an image.
 
         Some cameras (mostly Canon and Nikon) support capturing to internal
@@ -690,33 +827,44 @@ class Camera(object):
         you want to save the images to the memory card. On devices that
         do not support saving to RAM, the only difference is that the file
         is automatically downloaded and deleted when set to `False`.
+        Some cameras do not fire lib.GP_EVENT_CAPTURE_COMPLETE, hence the timeout.
 
         :param to_camera_storage:   Save image to the camera's internal storage
         :type to_camera_storage:    bool
-        :return:    A :py:class:`File` if `to_camera_storage` was `True`,
-                    otherwise the captured image as a bytestring.
-        :rtype:     :py:class:`File` or bytes
+        :param timeout:   how long to wait for images to be stored
+        :type timeout:    int how long in seconds to wait
+        :return:    Generator of :py:class:`File` if `to_camera_storage` was `True`,
+                    otherwise the captured image as BytesIO.
+        :rtype:     generator of :py:class:`File` or BytesIO
         """
+
         target = self.config['settings']['capturetarget']
         if to_camera_storage and target.value != "Memory card":
             target.set("Memory card")
         elif not to_camera_storage and target.value != "Internal RAM":
             target.set("Internal RAM")
-        lib.gp_camera_trigger_capture(self._cam, self._ctx)
+        del target
 
-        fobj = self._wait_for_event(event_type=lib.GP_EVENT_FILE_ADDED)
+        lib.gp_camera_trigger_capture(self._cam, self._ctx)
+        fobjs = self._wait_for_event(event_type=lib.GP_EVENT_FILE_ADDED,
+                                     exit_event_type=lib.GP_EVENT_CAPTURE_COMPLETE,
+                                     timeout=timeout)
+
         if to_camera_storage:
-            self._logger.info("File written to storage at {0}.".format(fobj))
-            return fobj
+            for f in fobjs:
+                self._logger.info("File written to storage at {0}.".format(f))
+                yield f
         else:
-            data = fobj.get_data()
-            try:
-                fobj.remove()
-            except errors.CameraIOError:
-                # That probably means the file is already gone from RAM,
-                # so nothing to worry about.
-                pass
-            return data
+            for f in fobjs:
+                with f:
+                    yield f.bytes_copy()
+                    try:
+                        # need to not shut down connection to camera
+                        # otherwise on the next iteration when the
+                        f.remove_noexit()
+                    except errors.CameraIOError:
+                        # removed from ram
+                        pass
 
     def capture_video_context(self):
         """ Get a :py:class:`VideoCaptureContext` object.
@@ -752,8 +900,8 @@ class Camera(object):
         This will usually be a JPEG image with the dimensions depending on
         the camera.
 
-        :return:    The preview image as a bytestring
-        :rtype:     bytes
+        :return:    The preview image as a BytesIO
+        :rtype:     BytesIO
         """
         camfile_p = ffi.new("CameraFile**")
         lib.gp_file_new(camfile_p)
@@ -761,7 +909,9 @@ class Camera(object):
         data_p = ffi.new("char**")
         length_p = ffi.new("unsigned long*")
         lib.gp_file_get_data_and_size(camfile_p[0], data_p, length_p)
-        return ffi.buffer(data_p[0], length_p[0])[:]
+        b = BytesIO(bytes(ffi.buffer(data_p[0], length_p[0])))
+        lib.gp_file_free(camfile_p[0])
+        return b
 
     @property
     def _cam(self):
@@ -769,7 +919,7 @@ class Camera(object):
             self.__cam = new_gp_object("Camera")
             if self._usb_address != (None, None):
                 port_name = ("usb:{0:03},{1:03}".format(*self._usb_address)
-                                                .encode())
+                             .encode())
                 port_list_p = new_gp_object("GPPortInfoList")
                 lib.gp_port_info_list_load(port_list_p)
                 port_info_p = ffi.new("GPPortInfo*")
@@ -795,35 +945,58 @@ class Camera(object):
             lib.gp_camera_get_abilities(self._cam, self.__abilities)
         return self.__abilities
 
-    def _wait_for_event(self, event_type=None, duration=0):
-        if event_type is None and not duration:
-            raise ValueError("Please specifiy either `event_type` or "
-                             "`duration!`")
+    def _wait_for_event(self, event_type=None, exit_event_type=None, timeout=10):
+        """
+        waits for an event from libgphoto2
+        primarily used for waiting for images to be written
+        timeouts and exit_event_type is mainly for capturing both jpeg and raw files.
+        :param event_type: event type to wait for,
+        :param exit_event_type: event that causes us to stop waiting.
+        :param timeout: timeout in seconds for how long to wait on events. set to default of 20s
+        :return: generator of :py:class:`File` if event_type is lib.GP_EVENT_FILE_ADDED
+        """
+        if event_type is None and not timeout:
+            raise ValueError("Please specifiy either `event_type` or `duration!`")
+
+        if event_type and not exit_event_type:
+            exit_event_type = event_type
+        if exit_event_type and not event_type:
+            event_type = exit_event_type
+
         start_time = time.time()
+
         event_type_p = ffi.new("CameraEventType*")
         event_data_p = ffi.new("void**", ffi.NULL)
+
+        dirs = list(self.list_all_directories())
         while True:
-            lib.gp_camera_wait_for_event(self._cam, 1000, event_type_p,
-                                         event_data_p, self._ctx)
-            if event_type_p[0] == lib.GP_EVENT_CAPTURE_COMPLETE:
+            lib.gp_camera_wait_for_event(self._cam, 1000,
+                                         event_type_p,
+                                         event_data_p,
+                                         self._ctx)
+
+            if event_type_p[0] == lib.GP_EVENT_FILE_ADDED and event_type == lib.GP_EVENT_FILE_ADDED:
+                camfile_p = ffi.cast("CameraFilePath*", event_data_p[0])
+                dirname = str(ffi.string(camfile_p[0].folder).decode())
+                name = str(ffi.string(camfile_p[0].name).decode())
+                directory = list(f for f in dirs if f.path == dirname)[0]
+                self._logger.info("File added {}".format(name))
+                yield File(name=name,
+                           directory=directory,
+                           camera=self)
+
+            elif event_type_p[0] == lib.GP_EVENT_CAPTURE_COMPLETE:
                 self._logger.info("Capture completed.")
-            elif event_type_p[0] == lib.GP_EVENT_FILE_ADDED:
-                self._logger.info("File added.")
             elif event_type_p[0] == lib.GP_EVENT_TIMEOUT:
                 self._logger.debug("Timeout while waiting for event.")
-                continue
-            do_break = (event_type_p[0] == event_type or
-                        ((time.time() - start_time > duration)
-                         if duration else False))
-            if do_break:
+            elif event_type_p[0] == lib.GP_EVENT_UNKNOWN:
+                self._logger.debug("Unknown event.")
+
+            if event_type_p[0] == exit_event_type:
                 break
-        if event_type == lib.GP_EVENT_FILE_ADDED:
-            camfile_p = ffi.cast("CameraFilePath*", event_data_p[0])
-            dirname = ffi.string(camfile_p[0].folder).decode()
-            directory = next(f for f in self.list_all_directories()
-                             if f.path == dirname)
-            return File(name=ffi.string(camfile_p[0].name).decode(),
-                        directory=directory, camera=self)
+
+            if timeout < time.time() - start_time:
+                break
 
     @exit_after
     def _get_config(self):
@@ -841,6 +1014,7 @@ class Camera(object):
                     item = ConfigItem(child_p[0], self)
                     out[key] = item
             return out
+
         root_widget = ffi.new("CameraWidget**")
         lib.gp_camera_get_config(self._cam, root_widget, self._ctx)
         return _widget_to_dict(root_widget[0])
