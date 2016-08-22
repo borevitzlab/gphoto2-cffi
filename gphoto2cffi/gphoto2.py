@@ -1018,7 +1018,8 @@ class Camera(object):
             elif event_type_p[0] == lib.GP_EVENT_TIMEOUT:
                 self._logger.debug("Timeout while waiting for event.")
             elif event_type_p[0] == lib.GP_EVENT_UNKNOWN:
-                self._logger.debug("Unknown event.")
+                pass
+                # self._logger.debug("Unknown event.")
 
             if img_count >= img_expect_count > 0:
                 break
