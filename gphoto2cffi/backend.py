@@ -19,7 +19,6 @@ FILE_TYPES = {
     'raw': _lib.GP_FILE_TYPE_RAW,
     'audio': _lib.GP_FILE_TYPE_AUDIO}
 
-
 #: Mapping from libgphoto2 types to their appropriate constructor functions.
 CONSTRUCTORS = {
     "Camera":       _lib.gp_camera_new,
@@ -63,6 +62,13 @@ CAM_OPS = IntEnum('CameraOperations', {
     'capture_preview': _lib.GP_OPERATION_CAPTURE_PREVIEW,
     'update_config': _lib.GP_OPERATION_CONFIG,
     'trigger_capture': _lib.GP_OPERATION_TRIGGER_CAPTURE})
+
+
+
+CAPTURE_TYPES = IntEnum('CaptureTypes', {
+    'capture_image': _lib.GP_CAPTURE_IMAGE,
+    'capture_video': _lib.GP_CAPTURE_MOVIE,
+    'capture_audio': _lib.GP_CAPTURE_SOUND})
 
 
 DIR_OPS = IntEnum('DirectoryOperations', {

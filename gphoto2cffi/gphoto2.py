@@ -841,58 +841,6 @@ class Camera(object):
 
         return list_dirs_recursively(self.filesystem)
 
-    @exit_after
-    def capture(self, to_camera_storage=False, timeout=10, img_expect_count=-1):
-        """ Capture an image.
-
-        Some cameras (mostly Canon and Nikon) support capturing to internal
-        RAM. On these devices, you have to specify `to_camera_storage` if
-        you want to save the images to the memory card. On devices that
-        do not support saving to RAM, the only difference is that the file
-        is automatically downloaded and deleted when set to `False`.
-        Some cameras do not fire lib.GP_EVENT_CAPTURE_COMPLETE, hence the timeout.
-
-        :param to_camera_storage:   Save image to the camera's internal storage
-        :type to_camera_storage:    bool
-        :param img_expect_count:    number of images expected from the camera.
-        :type img_expect_count:    int
-        :param timeout:   how long to wait for images to be stored
-        :type timeout:    int how long in seconds to wait
-        :return:    Generator of :py:class:`File` if `to_camera_storage` was `True`,
-                    otherwise the captured image as BytesIO.
-        :rtype:     generator of :py:class:`File` or BytesIO
-        """
-
-        target = self.config['settings']['capturetarget']
-        if to_camera_storage and target.value != "Memory card":
-            target.set("Memory card")
-        elif not to_camera_storage and target.value != "Internal RAM":
-            target.set("Internal RAM")
-        del target
-
-        lib.gp_camera_trigger_capture(self._cam, self._ctx)
-        fobjs = self._wait_for_event(event_type=lib.GP_EVENT_FILE_ADDED,
-                                         exit_event_type=lib.GP_EVENT_CAPTURE_COMPLETE,
-                                         img_expect_count=img_expect_count,
-                                         timeout=timeout)
-
-        if to_camera_storage:
-            for f in fobjs:
-                self._logger.info("File written to storage at {0}.".format(f))
-                yield f
-        else:
-            for f in fobjs:
-                # this downloads the file.
-                yield f.open()
-                f.free_file()
-                try:
-                    # need to not shut down connection to camera
-                    # otherwise on the next iteration when the
-                    f.remove_noexit()
-                except errors.CameraIOError:
-                    # removed from ram
-                    pass
-
     def capture_video_context(self):
         """ Get a :py:class:`VideoCaptureContext` object.
 
@@ -972,6 +920,172 @@ class Camera(object):
             lib.gp_camera_get_abilities(self._cam, self.__abilities)
         return self.__abilities
 
+    @exit_after
+    def capture(self, to_camera_storage=False, timeout=5, img_expect_count=-1):
+        """ Capture images and yields them as they area added.
+
+
+        :param to_camera_storage:   Save image to the camera's internal storage
+        :type to_camera_storage:    bool
+        :param img_expect_count:    number of images expected from the camera.
+        :type img_expect_count:    int
+        :param timeout:   how long to wait for images to be stored
+        :type timeout:    int how long in seconds to wait
+        :return:    Generator of :py:class:`File` if `to_camera_storage` was `True`,
+                    otherwise the captured image as BytesIO.
+        :rtype:     generator of :py:class:`File` or BytesIO
+        """
+        target = self.config['settings']['capturetarget']
+        if to_camera_storage and target.value != "Memory card":
+            target.set("Memory card")
+        elif not to_camera_storage and target.value != "Internal RAM":
+            target.set("Internal RAM")
+        del target
+
+        # This is the canonical way to capture, its the method used in the user
+        # facing 'gphoto2' program
+
+        # dont consume events!
+        dirs = list(self.list_all_directories())
+
+        # initial target file
+        camfile_p = ffi.new("CameraFilePath*")
+        lib.gp_camera_capture(self._cam, backend.CAPTURE_TYPES['capture_image'], camfile_p, self._ctx)
+
+        dirname = str(ffi.string(camfile_p[0].folder).decode())
+        directory = list(f for f in dirs if f.path == dirname)[0]
+        name = str(ffi.string(camfile_p[0].name).decode())
+        self._logger.info("Initial capture resulted in {}".format(name))
+        # yield the first fileif to_camera_storage:
+        if to_camera_storage:
+            yield File(filename=name, directory=directory, camera=self)
+        else:
+            f = File(filename=name, directory=directory, camera=self)
+            yield f.open()
+            f.free_file()
+            try:
+                # need to not shut down connection to camera
+                # otherwise on the next iteration will break
+                f.remove_noexit()
+            except errors.CameraIOError:
+                # removed from RAM
+                pass
+        # we have 1 file now.
+        img_count = 1
+
+        # wait for the rest
+        event_type_p = ffi.new("CameraEventType*")
+        event_data_p = ffi.new("void**", ffi.NULL)
+        # start timing
+        start_time = time.time()
+
+        # this loop is mostly identical to the one in _wait_for_event
+        # for some reason it was causing the images to be deleted from ram
+        # too quickly
+        while True:
+            # 200 is the lowest granularity to listen for events
+            result = lib.gp_camera_wait_for_event(self._cam, 200,
+                                         event_type_p,
+                                         event_data_p,
+                                         self._ctx)
+
+            if event_type_p[0] == lib.GP_EVENT_FILE_ADDED:
+                camfile_p = ffi.cast("CameraFilePath*", event_data_p[0])
+                dirname = str(ffi.string(camfile_p[0].folder).decode())
+                name = str(ffi.string(camfile_p[0].name).decode())
+                directory = list(f for f in dirs if f.path == dirname)[0]
+                self._logger.info("File added {}".format(name))
+                # print("File added {}{}".format(dirname, name))
+                img_count += 1
+                if to_camera_storage:
+                    yield File(filename=name, directory=directory, camera=self)
+                else:
+                    f = File(filename=name, directory=directory, camera=self)
+                    yield f.open()
+                    f.free_file()
+                    try:
+                        # need to not shut down connection to camera
+                        # otherwise on the next iteration will break
+                        f.remove_noexit()
+                    except errors.CameraIOError:
+                        # removed from RAM
+                        pass
+            elif event_type_p[0] == lib.GP_EVENT_CAPTURE_COMPLETE:
+                # print("Capture complete.")
+                self._logger.info("Capture complete.")
+            elif event_type_p[0] == lib.GP_EVENT_TIMEOUT:
+                # print("Timeout while waiting for event.")
+                self._logger.debug("Timeout while waiting for event.")
+            elif event_type_p[0] == lib.GP_EVENT_UNKNOWN:
+                self._logger.debug("Unknown event.")
+                pass
+
+            if img_count >= img_expect_count > 0:
+                break
+
+            if event_type_p[0] == lib.GP_EVENT_CAPTURE_COMPLETE:
+                break
+
+            if timeout < time.time() - start_time:
+                break
+        # can safely release camera after now.
+        self.release()
+
+    @exit_after
+    def trigger_capture_wait(self, to_camera_storage=False, timeout=10, img_expect_count=-1):
+        """ Capture images and yields them as they area added.
+
+        This method is recommended against in the gphoto2 code.
+        We dont know how long to wait for the images, and some cameras do not
+        fire FILE_ADDED when gp_camera_trigger_capture is called
+        Some cameras (mostly Canon and Nikon) support capturing to internal
+        RAM. On these devices, you have to specify `to_camera_storage` if
+        you want to save the images to the memory card. On devices that
+        do not support saving to RAM, the only difference is that the file
+        is automatically downloaded and deleted when set to `False`.
+        Some cameras do not fire lib.GP_EVENT_CAPTURE_COMPLETE, hence the timeout.
+
+        :param to_camera_storage:   Save image to the camera's internal storage
+        :type to_camera_storage:    bool
+        :param img_expect_count:    number of images expected from the camera.
+        :type img_expect_count:    int
+        :param timeout:   how long to wait for images to be stored
+        :type timeout:    int how long in seconds to wait
+        :return:    Generator of :py:class:`File` if `to_camera_storage` was `True`,
+                    otherwise the captured image as BytesIO.
+        :rtype:     generator of :py:class:`File` or BytesIO
+        """
+
+        target = self.config['settings']['capturetarget']
+        if to_camera_storage and target.value != "Memory card":
+            target.set("Memory card")
+        elif not to_camera_storage and target.value != "Internal RAM":
+            target.set("Internal RAM")
+        del target
+
+        lib.gp_camera_trigger_capture(self._cam, self._ctx)
+        fobjs = self._wait_for_event( event_type=lib.GP_EVENT_FILE_ADDED,
+                                     exit_event_type=lib.GP_EVENT_CAPTURE_COMPLETE,
+                                     img_expect_count=img_expect_count,
+                                     timeout=timeout)
+        if to_camera_storage:
+            for f in fobjs:
+                self._logger.info("File written to storage at {0}.".format(f))
+                yield f
+        else:
+
+            for f in fobjs:
+                # this downloads the file.
+                yield f.open()
+                f.free_file()
+                try:
+                    # need to not shut down connection to camera
+                    # otherwise on the next iteration when the
+                    f.remove_noexit()
+                except errors.CameraIOError:
+                    # removed from RAM
+                    pass
+
     def _wait_for_event(self, event_type=None, exit_event_type=None, img_expect_count=-1, timeout=10):
         """
         waits for an event from libgphoto2
@@ -983,12 +1097,16 @@ class Camera(object):
         :param timeout: timeout in seconds for how long to wait on events. set to default of 20s
         :return: generator of :py:class:`File` if event_type is lib.GP_EVENT_FILE_ADDED
         """
+        # having this within the loop consumes events for some reason.
+        dirs = list(self.list_all_directories())
         if event_type is None and not timeout:
             raise ValueError("Please specifiy either `event_type` or `duration!`")
 
+        # if exit_event_type not specified, only wait for the first event
         if event_type and not exit_event_type:
             exit_event_type = event_type
 
+        # and vice versa
         if exit_event_type and not event_type:
             event_type = exit_event_type
 
@@ -998,29 +1116,29 @@ class Camera(object):
         event_type_p = ffi.new("CameraEventType*")
         event_data_p = ffi.new("void**", ffi.NULL)
 
-        dirs = list(self.list_all_directories())
         while True:
-            lib.gp_camera_wait_for_event(self._cam, 1000,
+            result = lib.gp_camera_wait_for_event(self._cam, 300,
                                          event_type_p,
                                          event_data_p,
                                          self._ctx)
-
             if event_type_p[0] == lib.GP_EVENT_FILE_ADDED and event_type == lib.GP_EVENT_FILE_ADDED:
                 camfile_p = ffi.cast("CameraFilePath*", event_data_p[0])
                 dirname = str(ffi.string(camfile_p[0].folder).decode())
                 name = str(ffi.string(camfile_p[0].name).decode())
                 directory = list(f for f in dirs if f.path == dirname)[0]
                 self._logger.info("File added {}".format(name))
+                # print("File added {}{}".format(dirname, name))
                 img_count += 1
                 yield File(filename=name, directory=directory, camera=self)
             elif event_type_p[0] == lib.GP_EVENT_CAPTURE_COMPLETE:
-                self._logger.info("Capture completed.")
+                # print("Capture complete.")
+                self._logger.info("Capture complete.")
             elif event_type_p[0] == lib.GP_EVENT_TIMEOUT:
+                # print("Timeout while waiting for event.")
                 self._logger.debug("Timeout while waiting for event.")
             elif event_type_p[0] == lib.GP_EVENT_UNKNOWN:
+                self._logger.debug("Unknown event.")
                 pass
-                # self._logger.debug("Unknown event.")
-
             if img_count >= img_expect_count > 0:
                 break
 
