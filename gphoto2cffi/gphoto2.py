@@ -97,10 +97,15 @@ def exit_after(meth=None, cam_struc=None):
             cam, ctx = self._cam._cam, self._cam._ctx
         else:
             cam, ctx = self._cam, self._ctx
-        rval = meth(self, *args, **kwargs)
-        lib.gp_camera_exit(cam, ctx)
-        return rval
-
+        try:
+            rval = meth(self, *args, **kwargs)
+        except:
+            pass
+        else:
+            return rval
+        finally:
+            # always exit camera...
+            lib.gp_camera_exit(cam, ctx)
     return wrapped
 
 
@@ -950,8 +955,10 @@ class Camera(object):
 
         # initial target file
         camfile_p = ffi.new("CameraFilePath*")
-        lib.gp_camera_capture(self._cam, backend.CAPTURE_TYPES['capture_image'], camfile_p, self._ctx)
-
+        result=lib.gp_camera_capture(self._cam, backend.CAPTURE_TYPES['capture_image'], camfile_p, self._ctx)
+        # if result !=0:
+        #     self._logger.error("Couldnt capture for some reason...")
+        #     raise StopIteration
         dirname = str(ffi.string(camfile_p[0].folder).decode())
         directory = list(f for f in dirs if f.path == dirname)[0]
         name = str(ffi.string(camfile_p[0].name).decode())
@@ -970,6 +977,7 @@ class Camera(object):
             except errors.CameraIOError:
                 # removed from RAM
                 pass
+        del camfile_p
         # we have 1 file now.
         img_count = 1
 
@@ -1010,6 +1018,7 @@ class Camera(object):
                     except errors.CameraIOError:
                         # removed from RAM
                         pass
+                del camfile_p
             elif event_type_p[0] == lib.GP_EVENT_CAPTURE_COMPLETE:
                 # print("Capture complete.")
                 self._logger.info("Capture complete.")
