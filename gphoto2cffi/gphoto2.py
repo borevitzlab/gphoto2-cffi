@@ -31,7 +31,7 @@ def get_library_version():
     return tuple(int(x) for x in version_str.split('.'))
 
 
-def list_cameras():
+def list_cameras(lazy=True):
     """ List all attached USB cameras that are supported by libgphoto2.
 
     :return:    All recognized cameras
@@ -57,7 +57,8 @@ def list_cameras():
         lib.gp_abilities_list_get_abilities(abilities_list_p, ability_idx,
                                             abilities)
         if abilities.device_type == lib.GP_DEVICE_STILL_CAMERA:
-            out.append(Camera(bus_no, device_no, lazy=True,
+            out.append(Camera(bus_no, device_no,
+                              lazy=lazy,
                               _abilities=abilities))
     lib.gp_list_free(camlist_p)
     lib.gp_port_info_list_free(port_list_p)
@@ -99,12 +100,11 @@ def exit_after(meth=None, cam_struc=None):
             cam, ctx = self._cam, self._ctx
         try:
             rval = meth(self, *args, **kwargs)
-        except:
-            pass
+        except Exception as e:
+            print(str(e))
         else:
             return rval
         finally:
-            # always exit camera...
             lib.gp_camera_exit(cam, ctx)
     return wrapped
 
@@ -955,7 +955,7 @@ class Camera(object):
 
         # initial target file
         camfile_p = ffi.new("CameraFilePath*")
-        result=lib.gp_camera_capture(self._cam, backend.CAPTURE_TYPES['capture_image'], camfile_p, self._ctx)
+        result = lib.gp_camera_capture(self._cam, backend.CAPTURE_TYPES['capture_image'], camfile_p, self._ctx)
         # if result !=0:
         #     self._logger.error("Couldnt capture for some reason...")
         #     raise StopIteration
@@ -963,7 +963,7 @@ class Camera(object):
         directory = list(f for f in dirs if f.path == dirname)[0]
         name = str(ffi.string(camfile_p[0].name).decode())
         self._logger.info("Initial capture resulted in {}".format(name))
-        # yield the first fileif to_camera_storage:
+        # yield the first file if to_camera_storage:
         if to_camera_storage:
             yield File(filename=name, directory=directory, camera=self)
         else:
@@ -977,6 +977,7 @@ class Camera(object):
             except errors.CameraIOError:
                 # removed from RAM
                 pass
+        # delete that file
         del camfile_p
         # we have 1 file now.
         img_count = 1
@@ -1037,8 +1038,9 @@ class Camera(object):
 
             if timeout < time.time() - start_time:
                 break
+        del event_type_p
+        del event_data_p
         # can safely release camera after now.
-        self.release()
 
     @exit_after
     def trigger_capture_wait(self, to_camera_storage=False, timeout=10, img_expect_count=-1):
