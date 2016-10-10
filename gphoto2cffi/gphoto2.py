@@ -139,6 +139,7 @@ class VideoCaptureContext(object):
     Can also be used as a context manager, where the capture will be stopped
     upon leaving. Get the resulting videofile by accessing the
     :py:attr:`videofile` attribute.
+
     """
 
     def __init__(self, camera):
